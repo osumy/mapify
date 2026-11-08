@@ -1,13 +1,13 @@
-"""Core scraper orchestrator for Mapify: Playwright Stealth + Network Interception."""
+"""Hardened Playwright scraper orchestrator for Mapify."""
 
 import asyncio
 import random
 import re
 from typing import Optional, Tuple, List, Dict, Any
-from urllib.parse import quote_plus, unquote
+from urllib.parse import quote_plus
 
 from loguru import logger
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TargetClosedError
 from playwright_stealth import Stealth
 
 from src.config import ScraperConfig
@@ -15,8 +15,8 @@ from src.db import CafeRecord, DatabaseManager
 from src.interceptor import PhotoInterceptor
 from src.matcher import evaluate_candidate, haversine_distance, MatchResult
 
-RE_HREF_COORDS = re.compile(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)")
-RE_URL_COORDS = re.compile(r"/@(-?\d+\.\d+),(-?\d+\.\d+)")
+RE_PIN_COORDS = re.compile(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)")
+RE_VIEWPORT_COORDS = re.compile(r"/@(-?\d+\.\d+),(-?\d+\.\d+)")
 
 
 class MapifyScraper:
@@ -29,6 +29,7 @@ class MapifyScraper:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.requests_in_context = 0
+        self.total_places_processed = 0
 
     async def start(self) -> None:
         """Launches Chromium with anti-bot bypass parameters."""
@@ -40,33 +41,36 @@ class MapifyScraper:
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
                 "--no-first-run",
                 "--no-default-browser-check",
-                "--disable-background-networking",
-                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1280,800",
             ]
         )
         await self._create_new_context()
 
     async def _create_new_context(self) -> None:
-        """Creates a clean browser context with stealth, cookies, and route filtering."""
+        """Creates a clean browser context with dynamic UA matching Chromium engine version."""
         if self.context:
             try:
                 await self.context.close()
             except Exception:
                 pass
 
-        logger.debug("Creating fresh browser context with stealth & consent cookies...")
+        chrome_ver = self.browser.version
+        major_ver = chrome_ver.split(".")[0]
+        ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver} Safari/537.36"
+
         self.context = await self.browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            user_agent=ua,
             locale="fa-IR",
             viewport={"width": 1280, "height": 800},
             extra_http_headers={
                 "Accept-Language": "fa,en-US;q=0.9,en;q=0.8",
-                "Sec-Ch-Ua": '"Chromium";v="128", "Google Chrome";v="128", "Not=A?Brand";v="24"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"Windows"',
+                "sec-ch-ua": f'"Chromium";v="{major_ver}", "Google Chrome";v="{major_ver}", "Not=A?Brand";v="24"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
             }
         )
 
@@ -74,29 +78,58 @@ class MapifyScraper:
         await self.context.add_cookies(self.config.CONSENT_COOKIES)
 
         self.page = await self.context.new_page()
-        await Stealth().apply_stealth_async(self.page)
 
-        # Block fonts and media to save bandwidth while keeping styles and images functional
+        # Stealth & Chrome runtime polyfill
+        await Stealth().apply_stealth_async(self.page)
+        await self.page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+        """)
+
+        # Block fonts & video to save bandwidth while keeping styles and images functional
         await self.page.route(
             "**/*",
-            lambda route: route.abort()
-            if route.request.resource_type in self.config.BLOCKED_RESOURCE_TYPES
-            else route.continue_()
+            lambda r: r.abort() if r.request.resource_type in self.config.BLOCKED_RESOURCE_TYPES else r.continue_()
         )
 
-        # Attach network interceptor for both responses and requests
+        # Attach network interceptors
         self.page.on("response", self.interceptor.handle_response)
         self.page.on("request", self.interceptor.handle_request)
         self.requests_in_context = 0
 
+    async def _ensure_browser_alive(self) -> None:
+        """Auto-recovers from Chromium crashes or restarts browser every 300 places to prevent memory leaks."""
+        needs_restart = (
+            not self.browser
+            or not self.browser.is_connected()
+            or self.total_places_processed >= 300
+        )
+        if needs_restart:
+            logger.info("Recycling Chromium browser process to maintain zero RAM leaks...")
+            try:
+                await self.close()
+            except Exception:
+                pass
+            await self.start()
+            self.total_places_processed = 0
+
     async def close(self) -> None:
-        """Cleans up browser resources."""
+        """Cleans up all browser resources."""
         if self.context:
-            await self.context.close()
+            try:
+                await self.context.close()
+            except Exception:
+                pass
         if self.browser:
-            await self.browser.close()
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
         if self.playwright:
-            await self.playwright.stop()
+            try:
+                await self.playwright.stop()
+            except Exception:
+                pass
         logger.info("Scraper browser closed successfully.")
 
     def build_search_url(self, cafe: CafeRecord) -> str:
@@ -110,52 +143,66 @@ class MapifyScraper:
         logger.debug(f"Pacing pause for {delay:.2f}s...")
         await asyncio.sleep(delay)
 
+    async def _handle_consent_modal_if_present(self) -> None:
+        """Bypasses European/GDPR Google Consent modals if encountered."""
+        try:
+            consent_btn = self.page.locator(
+                "form[action*='consent'] button, button:has-text('Accept all'), button:has-text('قبول همه'), button:has-text('I agree')"
+            ).first
+            if await consent_btn.is_visible(timeout=500):
+                await consent_btn.click()
+                await self.page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
     async def _wait_for_page_signal(self, max_wait_seconds: float = 7.5) -> str:
         """
         Actively polls the page every 250ms up to max_wait_seconds.
         Returns: 'captcha', 'direct_place', 'search_feed', or 'not_found'.
         """
         start_time = asyncio.get_event_loop().time()
+        await self._handle_consent_modal_if_present()
+
         while (asyncio.get_event_loop().time() - start_time) < max_wait_seconds:
             cur_url = self.page.url
             if "google.com/sorry" in cur_url:
                 return "captcha"
 
-            # Check if URL transitioned to /maps/place/
+            # Direct Place check: URL is /maps/place/ AND h1.DUwDvf is visible
             if "/maps/place/" in cur_url:
                 h1_el = self.page.locator("h1.DUwDvf, h1").first
                 if await h1_el.is_visible():
                     return "direct_place"
 
-            # Check if search result cards are rendered
-            feed_links = self.page.locator("a[href*='/maps/place/']")
-            count = await feed_links.count()
-            if count > 0:
-                if "/maps/place/" in cur_url:
-                    return "direct_place"
+            # Search Feed check: div[role='feed'] is in DOM
+            if await self.page.locator("div[role='feed']").count() > 0:
                 return "search_feed"
 
-            # Check for explicit "not found" message
-            not_found_el = self.page.locator("text='نتیجه‌ای یافت نشد', text='هیچ نتیجه‌ای پیدا نشد', text='Google Maps can\'t find'")
+            # Not found messages
+            not_found_el = self.page.locator(
+                "text='نتیجه‌ای یافت نشد', text='هیچ نتیجه‌ای پیدا نشد', text=\"Google Maps can't find\""
+            )
             if await not_found_el.count() > 0:
                 return "not_found"
 
             await asyncio.sleep(0.25)
 
-        # Fallback evaluation after max_wait_seconds
+        # Fallback evaluation
         cur_url = self.page.url
         if "google.com/sorry" in cur_url:
             return "captcha"
         if "/maps/place/" in cur_url:
             return "direct_place"
-        if await self.page.locator("a[href*='/maps/place/']").count() > 0:
+        if await self.page.locator("div[role='feed']").count() > 0:
             return "search_feed"
         return "not_found"
 
     async def scrape_cafe(self, cafe: CafeRecord) -> Dict[str, Any]:
         """Scrapes photos and details for a single cafe record."""
-        # Context recycling to prevent Chromium memory leaks
+        await self._ensure_browser_alive()
         self.requests_in_context += 1
+        self.total_places_processed += 1
+
         if self.requests_in_context >= self.config.RECYCLE_CONTEXT_EVERY:
             logger.debug(f"Recycling browser context after {self.requests_in_context} requests to free RAM.")
             await self._create_new_context()
@@ -165,22 +212,18 @@ class MapifyScraper:
         logger.info(f"[{cafe.id}] Searching for '{cafe.name}' in {cafe.city or 'Iran'}...")
 
         try:
-            # 1. Navigate to search URL
-            await self.page.goto(search_url, wait_until="domcontentloaded", timeout=self.config.PAGE_TIMEOUT_MS)
+            resp = await self.page.goto(search_url, wait_until="domcontentloaded", timeout=self.config.PAGE_TIMEOUT_MS)
+            if resp and resp.status in (429, 503):
+                logger.warning(f"HTTP {resp.status} Rate Limit encountered on '{cafe.name}'!")
+                return {"status": "rate_limited", "photos": []}
 
-            # 2. Wait for active page signal (direct place, search feed, not found, or captcha)
             signal = await self._wait_for_page_signal(max_wait_seconds=7.5)
             current_url = self.page.url
 
-            # 3. Check for CAPTCHA / rate-limit redirect
             if signal == "captcha" or "google.com/sorry" in current_url:
                 logger.warning(f"Rate-limit / CAPTCHA detected on '{cafe.name}'! URL: {current_url}")
-                logger.info("Triggering defensive backoff cooldown of 60 seconds...")
-                await asyncio.sleep(60.0)
-                await self._create_new_context()
                 return {"status": "rate_limited", "photos": []}
 
-            # 4. Handle Direct Place vs Search Feed vs Not Found
             if signal == "direct_place":
                 return await self._handle_direct_place_page(cafe, search_url, current_url)
             elif signal == "search_feed":
@@ -194,6 +237,10 @@ class MapifyScraper:
                 )
                 return {"status": "not_found", "photos": []}
 
+        except TargetClosedError:
+            logger.warning("Browser target closed. Triggering recovery...")
+            await self._create_new_context()
+            return {"status": "error", "error": "TargetClosedError", "photos": []}
         except Exception as e:
             logger.error(f"Error scraping cafe '{cafe.name}' ({cafe.id}): {e}")
             self.db.save_place_and_photos(
@@ -208,7 +255,6 @@ class MapifyScraper:
         title = await self._get_h1_title()
         lat, lng = self._extract_coords_from_url(place_url)
 
-        # Match evaluation
         match = evaluate_candidate(
             target_name=cafe.name,
             target_lat=cafe.latitude,
@@ -235,10 +281,10 @@ class MapifyScraper:
             )
             return {"status": "not_found", "photos": []}
 
-        # Candidate is matched! Extract photos
         logger.success(f"Matched '{cafe.name}' -> '{title}' ({match.distance_meters:.1f}m, score={match.composite_score})")
-        photos = await self._harvest_photos()
-        logger.info(f"Harvested {len(photos)} photos for '{cafe.name}'.")
+        photos = await self._harvest_photos(venue_title=title or cafe.name)
+        owner_photos_count = sum(1 for p in photos if p.get("is_owner_photo") == 1)
+        logger.info(f"Harvested {len(photos)} photos ({owner_photos_count} owner/cover photos) for '{cafe.name}'.")
 
         self.db.save_place_and_photos(
             cafe=cafe,
@@ -249,24 +295,21 @@ class MapifyScraper:
             name_score=match.name_score,
             distance_meters=match.distance_meters,
             search_url=search_url,
-            google_maps_url=place_url,
+            google_maps_url=self.page.url,
             photos=photos
         )
 
         return {"status": "matched", "title": title, "photos": photos}
 
     async def _handle_search_feed_page(self, cafe: CafeRecord, search_url: str) -> Dict[str, Any]:
-        """Handles multi-result search feed by evaluating top 10 candidates within 300m."""
-        result_links = self.page.locator("a[href*='/maps/place/']")
+        """Handles multi-result search feed by evaluating top candidates within 300m."""
+        feed_container = self.page.locator("div[role='feed']")
+        result_links = feed_container.locator("a[href*='/maps/place/']")
         count = await result_links.count()
 
         if count == 0:
             logger.info(f"No results found for '{cafe.name}' within search area.")
-            self.db.save_place_and_photos(
-                cafe=cafe,
-                status="not_found",
-                search_url=search_url
-            )
+            self.db.save_place_and_photos(cafe=cafe, status="not_found", search_url=search_url)
             return {"status": "not_found", "photos": []}
 
         best_candidate = None
@@ -277,10 +320,7 @@ class MapifyScraper:
             link = result_links.nth(i)
             href = await link.get_attribute("href") or ""
             cand_title = await link.get_attribute("aria-label") or ""
-
-            # Extract coordinates from href (!3dlat!4dlng or /@lat,lng)
-            coords = self._extract_coords_from_href(href)
-            cand_lat, cand_lng = coords if coords else (None, None)
+            cand_lat, cand_lng = self._extract_coords_from_href(href)
 
             m = evaluate_candidate(
                 target_name=cafe.name,
@@ -306,50 +346,60 @@ class MapifyScraper:
 
         if not best_candidate or not best_match:
             logger.warning(f"No candidate matched for '{cafe.name}' among {inspect_limit} results.")
-            self.db.save_place_and_photos(
-                cafe=cafe,
-                status="not_found",
-                search_url=search_url
-            )
+            self.db.save_place_and_photos(cafe=cafe, status="not_found", search_url=search_url)
             return {"status": "not_found", "photos": []}
 
-        # Click into matched place to trigger full gallery / photos
-        logger.success(
-            f"Feed match for '{cafe.name}' -> '{best_candidate['title']}' "
-            f"({best_match.distance_meters:.1f}m, score={best_match.composite_score})"
-        )
+        # Navigate directly to the candidate's canonical place URL to prevent pushState delay
+        logger.success(f"Feed match for '{cafe.name}' -> '{best_candidate['title']}' ({best_match.distance_meters:.1f}m)")
         try:
-            await best_candidate["link_el"].click()
-            await self._wait_for_page_signal(max_wait_seconds=5.0)
-        except Exception as e:
-            logger.trace(f"Click on result link failed, navigating directly: {e}")
             await self.page.goto(best_candidate["href"], wait_until="domcontentloaded", timeout=15_000)
-            await self._wait_for_page_signal(max_wait_seconds=5.0)
+            await self.page.locator("h1.DUwDvf, h1").first.wait_for(state="visible", timeout=6_000)
+        except Exception:
+            try:
+                await best_candidate["link_el"].click()
+                await self.page.locator("h1.DUwDvf, h1").first.wait_for(state="visible", timeout=6_000)
+            except Exception:
+                pass
 
-        photos = await self._harvest_photos()
-        logger.info(f"Harvested {len(photos)} photos for '{cafe.name}'.")
+        title = await self._get_h1_title() or best_candidate["title"]
+        photos = await self._harvest_photos(venue_title=title)
+        canonical_url = self.page.url if "/maps/place/" in self.page.url else best_candidate["href"]
+        owner_photos_count = sum(1 for p in photos if p.get("is_owner_photo") == 1)
+        logger.info(f"Harvested {len(photos)} photos ({owner_photos_count} owner/cover photos) for '{cafe.name}'.")
 
         self.db.save_place_and_photos(
             cafe=cafe,
             status="matched",
-            title=best_candidate["title"],
+            title=title,
             scraped_lat=best_candidate["lat"],
             scraped_lng=best_candidate["lng"],
             name_score=best_match.name_score,
             distance_meters=best_match.distance_meters,
             search_url=search_url,
-            google_maps_url=self.page.url,
+            google_maps_url=canonical_url,
             photos=photos
         )
+        return {"status": "matched", "title": title, "photos": photos}
 
-        return {"status": "matched", "title": best_candidate["title"], "photos": photos}
+    async def _harvest_photos(self, venue_title: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Harvests photos and distinguishes owner uploads from public uploads."""
+        self.interceptor.set_venue_context(venue_title)
 
-    async def _harvest_photos(self) -> List[Dict[str, Any]]:
-        """Harvests photos by triggering the photo gallery and reading DOM images."""
-        # 1. Trigger photo drawer / tab
+        # 1. Harvest hero/cover image first as guaranteed owner/cover photo
+        try:
+            hero_img = self.page.locator("div[jsaction*='pane.heroHeaderImage'] img, button[jsaction*='heroHeaderImage'] img").first
+            if await hero_img.is_visible(timeout=1000):
+                hero_src = await hero_img.get_attribute("src")
+                if hero_src:
+                    self.interceptor.add_photo(hero_src, source_type="cover", is_owner_photo=1)
+        except Exception:
+            pass
+
+        # 2. Trigger photo drawer & owner tab
         await self._trigger_photo_drawer()
+        await self.interceptor.drain_pending_tasks(timeout=2.0)
 
-        # 2. Extract DOM images
+        # 3. Extract DOM images
         try:
             dom_imgs = await self.page.locator("img, div[style*='background-image']").evaluate_all('''elements => {
                 const res = [];
@@ -368,7 +418,7 @@ class MapifyScraper:
         return self.interceptor.get_photos()
 
     async def _trigger_photo_drawer(self) -> None:
-        """Clicks on photos tab or hero image to trigger Google Maps photo gallery RPCs."""
+        """Clicks on photos tab or hero image, checks for Owner tab, and triggers pagination RPCs."""
         try:
             # Try finding the photos tab or hero header button
             photo_btn = self.page.locator(
@@ -381,10 +431,42 @@ class MapifyScraper:
                 await photo_btn.click()
                 await self.page.wait_for_timeout(1500)
 
-                # Scroll the photo drawer 2-3 times to trigger pagination RPCs
+                # Check if "از مالک" / "By owner" tab is available in the gallery header
+                try:
+                    owner_tab = self.page.locator(
+                        "button[role='tab']:has-text('از مالک'), button[role='tab']:has-text('By owner'), "
+                        "button:has-text('از مالک'), button:has-text('By owner'), "
+                        "button[aria-label*='مالک'], button[aria-label*='owner' i]"
+                    ).first
+                    if await owner_tab.is_visible(timeout=800):
+                        await owner_tab.click()
+                        await self.page.wait_for_timeout(1000)
+                        # Scroll owner tab
+                        for _ in range(2):
+                            await self.page.keyboard.press("PageDown")
+                            await self.page.wait_for_timeout(400)
+
+                        # Tag currently captured photos as owner
+                        for photo in self.interceptor.captured_photos.values():
+                            photo["is_owner_photo"] = 1
+                            if photo.get("source_type") != "cover":
+                                photo["source_type"] = "owner"
+
+                        # Return to "همه" / "All" tab to capture full gallery as well
+                        all_tab = self.page.locator(
+                            "button[role='tab']:has-text('همه'), button[role='tab']:has-text('All'), "
+                            "button:has-text('همه'), button:has-text('All')"
+                        ).first
+                        if await all_tab.is_visible(timeout=800):
+                            await all_tab.click()
+                            await self.page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+                # Scroll the photo drawer 2-3 times to trigger pagination RPCs for all photos
                 for _ in range(3):
                     await self.page.keyboard.press("PageDown")
-                    await self.page.wait_for_timeout(500)
+                    await self.page.wait_for_timeout(400)
         except Exception as e:
             logger.trace(f"Photo drawer trigger note: {e}")
 
@@ -400,17 +482,21 @@ class MapifyScraper:
 
     @staticmethod
     def _extract_coords_from_url(url: str) -> Tuple[Optional[float], Optional[float]]:
-        m = RE_URL_COORDS.search(url)
-        if m:
-            return float(m.group(1)), float(m.group(2))
+        # Prioritize exact place pin (!3d...!4d...) over camera viewport (/@...)
+        m_pin = RE_PIN_COORDS.search(url)
+        if m_pin:
+            return float(m_pin.group(1)), float(m_pin.group(2))
+        m_vp = RE_VIEWPORT_COORDS.search(url)
+        if m_vp:
+            return float(m_vp.group(1)), float(m_vp.group(2))
         return None, None
 
     @staticmethod
-    def _extract_coords_from_href(href: str) -> Optional[Tuple[float, float]]:
-        m = RE_HREF_COORDS.search(href)
-        if m:
-            return float(m.group(1)), float(m.group(2))
-        m2 = RE_URL_COORDS.search(href)
-        if m2:
-            return float(m2.group(1)), float(m2.group(2))
-        return None
+    def _extract_coords_from_href(href: str) -> Tuple[Optional[float], Optional[float]]:
+        m_pin = RE_PIN_COORDS.search(href)
+        if m_pin:
+            return float(m_pin.group(1)), float(m_pin.group(2))
+        m_vp = RE_VIEWPORT_COORDS.search(href)
+        if m_vp:
+            return float(m_vp.group(1)), float(m_vp.group(2))
+        return None, None
