@@ -1,11 +1,14 @@
 """CLI runner for Mapify Google Maps Cafe Photo Scraper."""
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional, List, Dict, Any
 
 from loguru import logger
 from tqdm import tqdm
