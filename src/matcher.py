@@ -1,11 +1,10 @@
-"""Matching engine for validating Google Maps search candidates against target cafe records."""
+"""Hardened matching engine for validating Google Maps search candidates against target cafe records."""
 
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import math
 import re
-from typing import Optional, List, Tuple
-from urllib.parse import urlparse
+from typing import Optional, List, Set, Tuple
 
 STOP_WORDS = {
     'کافه', 'رستوران', 'کافی', 'شاپ', 'قهوه', 'بار', 'لانژ', 'فست', 'فود', 'عمارت', 'خانه', 'سرای',
@@ -22,7 +21,7 @@ PERSIAN_TO_LATIN = {
     'ر': 'r', 'ز': 'z', 'ژ': 'zh', 'س': 's', 'ش': 'sh', 'ص': 's',
     'ض': 'z', 'ط': 't', 'ظ': 'z', 'ع': 'a', 'غ': 'gh', 'ف': 'f',
     'ق': 'gh', 'ک': 'k', 'گ': 'g', 'ل': 'l', 'م': 'm', 'ن': 'n',
-    'و': 'o', 'ه': 'h', 'ی': 'i', 'ي': 'i', 'ك': 'k', 'ة': 'h',
+    'و': 'v', 'ه': 'h', 'ی': 'i', 'ي': 'i', 'ى': 'i', 'ك': 'k', 'ة': 'h',
     'ء': '', 'ئ': 'i', 'ؤ': 'o'
 }
 
@@ -32,7 +31,8 @@ COMMON_TRANSLATIONS = {
     'بناک': 'bonak', 'آویژه': 'avizhe', 'سلوبون': 'celebon', 'گستو': 'gusto',
     'اگومان': 'agoman', 'کارزین': 'karzin', 'عباس': 'abbas', 'اقا': 'agha',
     'میلاد': 'milad', 'دنیز': 'deniz', 'روژه': 'rojeh', 'ویش': 'wish',
-    'لیار': 'leymer', 'دیگر': 'andorra', 'نیلی': 'nili', 'پروچلو': 'prochelo'
+    'لیار': 'leymer', 'دیگر': 'andorra', 'نیلی': 'nili', 'پروچلو': 'prochelo',
+    'ویونا': 'viuna', 'لامیز': 'lameiz'
 }
 
 
@@ -47,39 +47,29 @@ class MatchResult:
     rejection_reason: Optional[str] = None
 
 
-def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Calculates haversine distance in meters between two coordinates."""
-    if None in (lat1, lon1, lat2, lon2):
-        return float('inf')
-    try:
-        lat1, lon1, lat2, lon2 = float(lat1), float(lon1), float(lat2), float(lon2)
-    except (ValueError, TypeError):
-        return float('inf')
-
-    R = 6371000.0  # Earth radius in meters
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2.0)**2
-    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
-    return R * c
-
-
 def normalize_text(text: str) -> str:
-    """Normalize Persian/Arabic characters, digits, and remove diacritics."""
+    """Exhaustive Persian/Arabic text normalizer handling ZWNJ, BiDi, Tatweel, diacritics."""
     if not text:
         return ""
     t = text.lower()
-    t = t.replace('ي', 'ی').replace('ك', 'ک').replace('ة', 'ه').replace('ۀ', 'ه')
+    # Strip BiDi directional formatting codes & ZWNJ/ZWSP
+    t = re.sub(r'[\u200c\u200b\u200e\u200f\u202a-\u202e]', ' ', t)
+    # Strip Tatweel (kashida)
+    t = t.replace('\u0640', '')
+    # Arabic to Persian normalization
+    t = t.replace('ي', 'ی').replace('ى', 'ی').replace('ك', 'ک').replace('ة', 'ه').replace('ۀ', 'ه')
     t = t.replace('آ', 'ا').replace('أ', 'ا').replace('إ', 'ا').replace('ؤ', 'و').replace('ئ', 'ی')
+    # Strip Arabic harakat/diacritics
     t = re.sub(r'[\u064B-\u065F\u0670]', '', t)
+    # Persian & Arabic digits
     digits_map = {
         '۰': '0', '۱': '1', '۲': '2', '۳': '3', '۴': '4', '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9',
         '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4', '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9'
     }
     for k, v in digits_map.items():
         t = t.replace(k, v)
-    t = re.sub(r'[\(\)\[\]\{\}\-_,\.\+:;/\&\\\|\'\"`!?]', ' ', t)
+    # Persian and standard punctuation
+    t = re.sub(r'[\(\)\[\]\{\}\-_,\.\+:;/\&\\\|\'\"`!?؟،؛«»•–—…]', ' ', t)
     return ' '.join(t.split())
 
 
@@ -108,39 +98,58 @@ def to_phonetic_latin(tokens: List[str]) -> List[str]:
 
 
 def compute_name_similarity(name1: str, name2: str) -> float:
-    """Computes similarity between two venue names using direct, joined, and phonetic matching."""
+    """Computes similarity between two venue names using direct, joined, phonetic, and guarded token matching."""
     if not name1 or not name2:
         return 0.0
 
     tok1 = clean_tokens(name1)
     tok2 = clean_tokens(name2)
 
-    # 1. Direct Persian text ratio (with spaces)
-    s1 = ' '.join(tok1)
-    s2 = ' '.join(tok2)
+    s1, s2 = ' '.join(tok1), ' '.join(tok2)
     direct_ratio = SequenceMatcher(None, s1, s2).ratio()
 
-    # 2. Joined text ratio (handles compound words like prochelo vs pro chelo)
-    joined_s1 = ''.join(tok1)
-    joined_s2 = ''.join(tok2)
+    joined_s1, joined_s2 = ''.join(tok1), ''.join(tok2)
     joined_ratio = SequenceMatcher(None, joined_s1, joined_s2).ratio()
 
-    # 3. Phonetic Latin ratio
-    lat1 = to_phonetic_latin(tok1)
-    lat2 = to_phonetic_latin(tok2)
-    lat_s1 = ''.join(lat1)
-    lat_s2 = ''.join(lat2)
+    lat1, lat2 = to_phonetic_latin(tok1), to_phonetic_latin(tok2)
+    lat_s1, lat_s2 = ''.join(lat1), ''.join(lat2)
     phonetic_ratio = SequenceMatcher(None, lat_s1, lat_s2).ratio() if (lat_s1 and lat_s2) else 0.0
 
-    # 4. Token containment
-    set1, set2 = set(lat1), set(lat2)
+    # Guarded token containment (only for tokens >= 3 chars to prevent false single-letter positives)
+    set1 = {t for t in lat1 if len(t) >= 3}
+    set2 = {t for t in lat2 if len(t) >= 3}
     if set1 and set2:
         overlap = len(set1 & set2) / min(len(set1), len(set2))
-        containment = 1.0 if (set1.issubset(set2) or set2.issubset(set1)) else overlap
+        containment = 0.85 if (set1.issubset(set2) or set2.issubset(set1)) else (overlap * 0.8)
     else:
         containment = 0.0
 
-    return round(max(direct_ratio, joined_ratio, phonetic_ratio, containment * 0.9), 2)
+    return round(max(direct_ratio, joined_ratio, phonetic_ratio, containment), 2)
+
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculates haversine distance in meters with full coordinate sanity validation."""
+    if None in (lat1, lon1, lat2, lon2):
+        return float('inf')
+    try:
+        lat1, lon1, lat2, lon2 = float(lat1), float(lon1), float(lat2), float(lon2)
+        # Coordinate sanity checks
+        if not (-90.0 <= lat1 <= 90.0 and -90.0 <= lat2 <= 90.0):
+            return float('inf')
+        if not (-180.0 <= lon1 <= 180.0 and -180.0 <= lon2 <= 180.0):
+            return float('inf')
+        if (lat1 == 0.0 and lon1 == 0.0) or (lat2 == 0.0 and lon2 == 0.0):
+            return float('inf')
+    except (ValueError, TypeError):
+        return float('inf')
+
+    R = 6371000.0  # Earth radius in meters
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2.0)**2
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+    return R * c
 
 
 def evaluate_candidate(
