@@ -15,21 +15,23 @@ An enterprise-grade, rate-limit immune pipeline designed to extract original cam
   - Requires **no Google account login**, eliminating account bans, suspension risks, or credential rotation.
   - Automatically injects GDPR/EU consent cookies (`SOCS`, `CONSENT=YES+`) to bypass privacy consent walls seamlessly.
 - **BotGuard & Fingerprint Evasion (Playwright Stealth):**
-  - Defeats Google Maps dynamic JavaScript virtual machine (`BotGuard`) through Playwright Stealth.
+  - Defeats Google Maps dynamic JavaScript virtual machine (`BotGuard`) through Playwright Stealth, removing `navigator.webdriver` at the engine level via `--disable-blink-features=AutomationControlled` and polyfilling `window.chrome`.
   - Emulates authentic human interactions, viewport metrics, and randomized jitter delays (4.5s – 8.5s).
 - **Camera-Master Resolution (`=s0-rw`):**
   - Intercepts all Google CDN photo endpoints (`/grass-cs/`, `/gpms-cs-s/`, `/gps-cs-s/`, `/p/`).
   - Automatically transforms thumbnail parameters into maximum camera sensor resolutions in modern, lossless/high-efficiency WebP format.
+- **Owner vs. User Photo Classification:**
+  - Categorizes all harvested photos without discarding any URLs. Differentiates curated, high-quality business owner uploads (`is_owner_photo = 1`) from customer UGC (`is_owner_photo = 0`) via merchant endpoints (`/gpms-cs-s/`, `/grass-cs/`), cover photos, author matching, and the dedicated "By owner" gallery drawer.
 - **Canonical Place Identifiers Extraction:**
   - Decodes Google's binary protobuf format to compute official **Place IDs** (`ChIJ...`), decimal **CIDs** (`989303...`), hex **Feature IDs** (`0x...:0x...`), and Knowledge Graph IDs (**KGMID** `/g/...`) directly from URLs with zero additional network requests.
 - **Robust Persian & Multilingual NLP Matcher:**
-  - Handles Persian character variants, diacritics, compound words (e.g. `پروچلو` vs `پرو چلو`), city stop words, and phonetic Latin transliteration.
-  - Enforces strict 300m Haversine geographic radius cutoffs to eliminate false positives.
+  - Handles Persian character variants, ZWNJ (`\u200c`), BiDi markers, Tatweel, diacritics, compound words (e.g. `پروچلو` vs `پرو چلو`), city stop words, and phonetic Latin transliteration.
+  - Enforces strict 300m Haversine geographic radius cutoffs with coordinate sanity validation.
 - **Memory & Resource Optimized:**
-  - Automatically recycles Chromium browser contexts every 20 places to prevent WebGL/tile RAM accumulation.
-  - Includes periodic batch cooldowns (120s every 35 venues).
+  - Recycles Chromium contexts every 20 places and browser processes every 300 places to ensure 0 MB memory leakage.
+  - Includes periodic batch cooldowns (120s every 35 venues) and automated recovery from `TargetClosedError`.
 - **Kaggle-Ready & Parallel Sharding:**
-  - Includes a self-contained Jupyter notebook (`mapify_kaggle.ipynb`) and automatic database splitter (`split_shards.py`) and merger (`merge_shards.py`) to run up to 8 shards simultaneously.
+  - Includes a modular Jupyter notebook (`mapify_kaggle.ipynb`) and automatic database splitter (`split_shards.py`) and merger (`merge_shards.py`) to run up to 8 shards simultaneously.
 
 ---
 
@@ -41,14 +43,15 @@ flowchart TD
     SPLIT --> BATCH[Pending Venue Queue]
     BATCH --> BROWSER[Playwright Chromium + Stealth + Consent Cookies]
     BROWSER -->|Dynamic SPA Polling| SIGNAL{Page Signal Detection}
-    SIGNAL -->|Direct Place Page| DIRECT[H1 Title & Coordinates]
+    SIGNAL -->|Direct Place Page| DIRECT[H1 Title & Pin Coordinates]
     SIGNAL -->|Search Feed| FEED[Evaluate Top 10 Candidates within 300m]
-    FEED --> CLICK[Select & Click Best Match]
+    FEED --> CLICK[Direct Navigation to Best Match]
     CLICK --> DIRECT
     DIRECT --> MATCH{Matcher: 300m Cutoff + NLP Score >= 0.75}
     MATCH -->|Rejected| REJECT[Record as not_found]
     MATCH -->|Matched| HARVEST[Harvest Photos & Decode Protobuf Identifiers]
-    HARVEST --> NET[Network Interceptor: Catch CDN & RPC URLs]
+    HARVEST --> OWNER[Owner Detection: Hero Image + 'By Owner' Tab]
+    OWNER --> NET[Network Interceptor: Catch CDN & RPC URLs]
     NET --> MOD[Transform to =s0-rw Camera Master WebP]
     MOD --> OUT[(Output SQLite DB: places & place_photos)]
 ```
@@ -84,7 +87,8 @@ flowchart TD
 | `cafe_id` | `INTEGER` | Foreign key referencing `places(cafe_id)` |
 | `photo_url` | `TEXT` | Base Google CDN image URL |
 | `high_res_url` | `TEXT` | Pristine original resolution URL (`=s0-rw`) |
-| `source_type` | `TEXT` | Origin discovery channel (`request`, `rpc`, `dom`) |
+| `source_type` | `TEXT` | Origin discovery channel (`cover`, `owner`, `gallery`, `dom`, `rpc`, `cdn_load`) |
+| `is_owner_photo` | `INTEGER` | `1` = uploaded by merchant / owner / cover image; `0` = customer UGC |
 | `author_name` | `TEXT` | Photo author name (if available) |
 | `created_at` | `TEXT` | ISO 8601 UTC timestamp |
 
@@ -131,7 +135,7 @@ python run.py --source-db /path/to/source.db --output-db /path/to/output.db
 
 ## ☁️ Running on Kaggle (Zero-Cost Cloud Processing)
 
-The repository provides a self-contained Kaggle notebook: **`mapify_kaggle.ipynb`**.
+The repository provides a modular, 5-cell Kaggle notebook: **`mapify_kaggle.ipynb`**.
 
 1. Upload `mapify_kaggle.ipynb` as a new Kaggle notebook.
 2. In the right panel under **Notebook Options**:
@@ -180,11 +184,6 @@ Tested against 10 real cafes from the production dataset:
 | **Average Photos per Venue** | **20.8 photos** |
 | **Rate-Limit / CAPTCHA Incidents** | **0% (100% clean)** |
 | **Sample Photo Dimensions** | **4284 × 5712 px (24.5 Megapixels WebP)** |
-
-### Comparison with Commercial Services (Apify)
-- **Place Coverage:** Mapify successfully discovered venues with variations (e.g. `عمارت پارسیان` and `کافه کیدل`) where commercial Apify actors failed (`not_found`).
-- **Image Quality:** Directly accesses raw camera-sensor assets (`=s0-rw`) up to 24.5 MP.
-- **Cost:** 100% self-hosted, independent, and free.
 
 ---
 
