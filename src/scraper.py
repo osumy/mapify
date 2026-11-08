@@ -7,7 +7,7 @@ from typing import Optional, Tuple, List, Dict, Any
 from urllib.parse import quote_plus
 
 from loguru import logger
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TargetClosedError
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Error
 from playwright_stealth import Stealth
 
 from src.config import ScraperConfig
@@ -237,10 +237,14 @@ class MapifyScraper:
                 )
                 return {"status": "not_found", "photos": []}
 
-        except TargetClosedError:
-            logger.warning("Browser target closed. Triggering recovery...")
-            await self._create_new_context()
-            return {"status": "error", "error": "TargetClosedError", "photos": []}
+        except Error as e:
+            if "target closed" in str(e).lower() or "connection closed" in str(e).lower():
+                logger.warning("Browser target closed. Triggering recovery...")
+                await self._create_new_context()
+                return {"status": "error", "error": "TargetClosedError", "photos": []}
+            logger.error(f"Playwright error scraping cafe '{cafe.name}' ({cafe.id}): {e}")
+            self.db.save_place_and_photos(cafe=cafe, status="error", search_url=search_url)
+            return {"status": "error", "error": str(e), "photos": []}
         except Exception as e:
             logger.error(f"Error scraping cafe '{cafe.name}' ({cafe.id}): {e}")
             self.db.save_place_and_photos(
