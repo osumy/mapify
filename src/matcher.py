@@ -120,7 +120,7 @@ def compute_name_similarity(name1: str, name2: str) -> float:
     s2 = ' '.join(tok2)
     direct_ratio = SequenceMatcher(None, s1, s2).ratio()
 
-    # 2. Joined Persian text ratio (handles compound words like پروچلو vs پرو چلو)
+    # 2. Joined text ratio (handles compound words like prochelo vs pro chelo)
     joined_s1 = ''.join(tok1)
     joined_s2 = ''.join(tok2)
     joined_ratio = SequenceMatcher(None, joined_s1, joined_s2).ratio()
