@@ -8,7 +8,7 @@ import re
 import sqlite3
 import struct
 import time
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
 from urllib.parse import unquote
 
 
@@ -32,7 +32,7 @@ class CafeRecord:
 def extract_place_identifiers(url: str) -> Dict[str, Optional[str]]:
     """
     Extracts canonical Google Maps identifiers from URL:
-    - place_id: Universal Google Place ID ('ChIJ...')
+    - place_id: Universal Google Place ID ('ChIJ...') computed offline from FID protobuf
     - cid: Customer ID decimal integer string
     - fid: Feature ID hex pair ('0x...:0x...')
     - kgmid: Knowledge Graph ID ('/g/...')
@@ -96,6 +96,7 @@ class DatabaseManager:
             conn = sqlite3.connect(db_path, timeout=60.0)
             conn.execute("PRAGMA journal_mode = WAL;")
             conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.execute("PRAGMA busy_timeout = 60000;")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -129,20 +130,15 @@ class DatabaseManager:
         );
         """)
 
-        # Migration: ensure cid, fid, kgmid columns exist if upgrading existing db
-        existing_cols = {c["name"] for c in cur.execute("PRAGMA table_info(places)").fetchall()}
-        for col in ["cid", "fid", "kgmid"]:
-            if col not in existing_cols:
-                cur.execute(f"ALTER TABLE places ADD COLUMN {col} TEXT;")
-
-        # Table for extracted photo URLs
+        # Table for extracted photo URLs with owner vs UGC classification
         cur.execute("""
         CREATE TABLE IF NOT EXISTS place_photos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             cafe_id INTEGER NOT NULL,
             photo_url TEXT NOT NULL,
             high_res_url TEXT NOT NULL,
-            source_type TEXT DEFAULT 'gallery',  -- 'request', 'rpc', 'dom'
+            source_type TEXT DEFAULT 'gallery',  -- 'cover', 'owner', 'gallery', 'dom', 'rpc', 'cdn_load'
+            is_owner_photo INTEGER DEFAULT 0,    -- 1 = uploaded by business owner/cover, 0 = customer/UGC
             author_name TEXT,
             created_at TEXT,
             UNIQUE(cafe_id, photo_url),
@@ -150,19 +146,30 @@ class DatabaseManager:
         );
         """)
 
+        # Migrations: ensure columns exist in existing output database
+        places_cols = {c["name"] for c in cur.execute("PRAGMA table_info(places)").fetchall()}
+        for col in ["cid", "fid", "kgmid"]:
+            if col not in places_cols:
+                cur.execute(f"ALTER TABLE places ADD COLUMN {col} TEXT;")
+
+        photo_cols = {c["name"] for c in cur.execute("PRAGMA table_info(place_photos)").fetchall()}
+        if "is_owner_photo" not in photo_cols:
+            cur.execute("ALTER TABLE place_photos ADD COLUMN is_owner_photo INTEGER DEFAULT 0;")
+
         # Indices
         cur.execute("CREATE INDEX IF NOT EXISTS idx_places_status ON places(status);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_places_place_id ON places(place_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_cafe ON place_photos(cafe_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_owner ON place_photos(is_owner_photo);")
 
         conn.commit()
         conn.close()
 
-    def get_already_processed_ids(self) -> set[int]:
-        """Returns set of cafe IDs already processed (either matched or not_found)."""
+    def get_already_processed_ids(self) -> Set[int]:
+        """Returns set of cafe IDs already resolved as matched or not_found (transient errors can be retried)."""
         conn = self._get_connection(self.output_db_path, read_only=True)
         cur = conn.cursor()
-        rows = cur.execute("SELECT cafe_id FROM places").fetchall()
+        rows = cur.execute("SELECT cafe_id FROM places WHERE status IN ('matched', 'not_found')").fetchall()
         processed = {r["cafe_id"] for r in rows}
         conn.close()
         return processed
@@ -204,7 +211,7 @@ class DatabaseManager:
             if end_id is not None and cid > end_id:
                 continue
 
-            # Sharding filter (e.g. shard 1 of 4: cid % 4 == 0)
+            # Modulo sharding filter (if specified on a non-presplit database)
             if total_shards and shard_id:
                 if (cid % total_shards) != (shard_id - 1):
                     continue
@@ -244,7 +251,7 @@ class DatabaseManager:
         google_maps_url: Optional[str] = None,
         photos: Optional[List[Dict[str, Any]]] = None
     ) -> None:
-        """Atomically saves a place record and all its associated photos with complete Google IDs."""
+        """Atomically saves a place record and all its associated photos with complete Google IDs and owner tags."""
         photos = photos or []
 
         # Auto-extract identifiers from google_maps_url if not explicitly provided
@@ -259,32 +266,52 @@ class DatabaseManager:
         cur = conn.cursor()
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-        cur.execute("""
-        INSERT OR REPLACE INTO places (
-            cafe_id, place_id, cid, fid, kgmid, title, searched_name, searched_lat, searched_lng,
-            scraped_lat, scraped_lng, address, status, name_score, distance_meters,
-            photos_count, search_url, google_maps_url, scraped_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            cafe.id, place_id, cid, fid, kgmid, title or cafe.name, cafe.name, cafe.latitude, cafe.longitude,
-            scraped_lat, scraped_lng, address, status, round(name_score, 2),
-            round(distance_meters, 1) if distance_meters is not None else None,
-            len(photos), search_url, google_maps_url, now_iso
-        ))
-
-        for p in photos:
+        try:
             cur.execute("""
-            INSERT OR IGNORE INTO place_photos (
-                cafe_id, photo_url, high_res_url, source_type, author_name, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO places (
+                cafe_id, place_id, cid, fid, kgmid, title, searched_name, searched_lat, searched_lng,
+                scraped_lat, scraped_lng, address, status, name_score, distance_meters,
+                photos_count, search_url, google_maps_url, scraped_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cafe_id) DO UPDATE SET
+                place_id = COALESCE(excluded.place_id, places.place_id),
+                cid = COALESCE(excluded.cid, places.cid),
+                fid = COALESCE(excluded.fid, places.fid),
+                kgmid = COALESCE(excluded.kgmid, places.kgmid),
+                title = CASE WHEN excluded.status = 'matched' THEN excluded.title ELSE places.title END,
+                status = CASE WHEN places.status = 'matched' THEN 'matched' ELSE excluded.status END,
+                scraped_lat = COALESCE(excluded.scraped_lat, places.scraped_lat),
+                scraped_lng = COALESCE(excluded.scraped_lng, places.scraped_lng),
+                name_score = CASE WHEN excluded.status = 'matched' THEN excluded.name_score ELSE places.name_score END,
+                distance_meters = CASE WHEN excluded.status = 'matched' THEN excluded.distance_meters ELSE places.distance_meters END,
+                photos_count = MAX(places.photos_count, excluded.photos_count),
+                google_maps_url = CASE WHEN excluded.status = 'matched' THEN excluded.google_maps_url ELSE places.google_maps_url END,
+                scraped_at = excluded.scraped_at;
             """, (
-                cafe.id,
-                p["photo_url"],
-                p.get("high_res_url", p["photo_url"]),
-                p.get("source_type", "gallery"),
-                p.get("author_name"),
-                now_iso
+                cafe.id, place_id, cid, fid, kgmid, title or cafe.name, cafe.name, cafe.latitude, cafe.longitude,
+                scraped_lat, scraped_lng, address, status, round(name_score, 2),
+                round(distance_meters, 1) if distance_meters is not None else None,
+                len(photos), search_url, google_maps_url, now_iso
             ))
 
-        conn.commit()
-        conn.close()
+            for p in photos:
+                cur.execute("""
+                INSERT INTO place_photos (
+                    cafe_id, photo_url, high_res_url, source_type, is_owner_photo, author_name, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cafe_id, photo_url) DO UPDATE SET
+                    is_owner_photo = MAX(place_photos.is_owner_photo, excluded.is_owner_photo),
+                    source_type = CASE WHEN excluded.is_owner_photo = 1 THEN excluded.source_type ELSE place_photos.source_type END;
+                """, (
+                    cafe.id,
+                    p["photo_url"],
+                    p.get("high_res_url", p["photo_url"]),
+                    p.get("source_type", "gallery"),
+                    int(p.get("is_owner_photo", 0)),
+                    p.get("author_name"),
+                    now_iso
+                ))
+
+            conn.commit()
+        finally:
+            conn.close()
