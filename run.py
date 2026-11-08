@@ -35,8 +35,14 @@ def setup_logger(log_dir: Path) -> None:
     )
 
 
-async def run_pipeline(scraper: MapifyScraper, pending_cafes: list, config: ScraperConfig) -> dict:
-    """Executes scraping pipeline across pending cafes with exponential backoff and circuit breaking."""
+async def run_pipeline(
+    scraper: MapifyScraper,
+    pending_cafes: list,
+    config: ScraperConfig,
+    shard_name: Optional[str] = None
+) -> dict:
+    """Executes scraping pipeline across pending cafes with exponential backoff, circuit breaking, and checkpointing."""
+    shard_label = shard_name or Path(config.SOURCE_DB_PATH).stem
     total_to_process = len(pending_cafes)
     matched_count = 0
     not_found_count = 0
@@ -58,7 +64,18 @@ async def run_pipeline(scraper: MapifyScraper, pending_cafes: list, config: Scra
                 consecutive_rate_limits += 1
                 logger.warning(f"Rate limited on cafe {cafe.id}! Consecutive hit #{consecutive_rate_limits}")
                 if consecutive_rate_limits >= 3:
-                    logger.critical("Aborting batch: 3 consecutive CAPTCHA / rate-limit responses. Stopping to prevent IP ban.")
+                    logger.critical("Aborting batch safely: 3 consecutive CAPTCHA / rate-limit responses. Checkpoint saved.")
+                    scraper.db.update_checkpoint(
+                        shard_name=shard_label,
+                        last_cafe_id=cafe.id,
+                        last_cafe_name=cafe.name,
+                        total_processed=idx,
+                        matched_count=matched_count,
+                        not_found_count=not_found_count,
+                        error_count=error_count,
+                        total_photos=total_photos,
+                        status="rate_limited"
+                    )
                     pbar.close()
                     return {
                         "matched": matched_count,
@@ -95,6 +112,19 @@ async def run_pipeline(scraper: MapifyScraper, pending_cafes: list, config: Scra
                     error_count += 1
                 break
 
+        # Persist checkpoint after each venue
+        scraper.db.update_checkpoint(
+            shard_name=shard_label,
+            last_cafe_id=cafe.id,
+            last_cafe_name=cafe.name,
+            total_processed=idx,
+            matched_count=matched_count,
+            not_found_count=not_found_count,
+            error_count=error_count,
+            total_photos=total_photos,
+            status="in_progress"
+        )
+
         pbar.update(1)
         pbar.set_postfix({
             "matched": matched_count,
@@ -112,6 +142,20 @@ async def run_pipeline(scraper: MapifyScraper, pending_cafes: list, config: Scra
                 await scraper._safe_delay()
 
     pbar.close()
+
+    # Finalize checkpoint status
+    scraper.db.update_checkpoint(
+        shard_name=shard_label,
+        last_cafe_id=pending_cafes[-1].id if pending_cafes else 0,
+        last_cafe_name=pending_cafes[-1].name if pending_cafes else "",
+        total_processed=len(pending_cafes),
+        matched_count=matched_count,
+        not_found_count=not_found_count,
+        error_count=error_count,
+        total_photos=total_photos,
+        status="completed"
+    )
+
     return {
         "matched": matched_count,
         "not_found": not_found_count,

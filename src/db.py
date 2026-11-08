@@ -162,6 +162,23 @@ class DatabaseManager:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_cafe ON place_photos(cafe_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_owner ON place_photos(is_owner_photo);")
 
+        # Checkpoint table for seamless auto-resume, status tracking, and monitoring
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS checkpoints (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            shard_name TEXT,
+            last_cafe_id INTEGER,
+            last_cafe_name TEXT,
+            total_processed INTEGER DEFAULT 0,
+            matched_count INTEGER DEFAULT 0,
+            not_found_count INTEGER DEFAULT 0,
+            error_count INTEGER DEFAULT 0,
+            total_photos INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'in_progress',
+            updated_at TEXT
+        );
+        """)
+
         conn.commit()
         conn.close()
 
@@ -315,3 +332,54 @@ class DatabaseManager:
             conn.commit()
         finally:
             conn.close()
+
+    def update_checkpoint(
+        self,
+        shard_name: str,
+        last_cafe_id: int,
+        last_cafe_name: str,
+        total_processed: int,
+        matched_count: int,
+        not_found_count: int,
+        error_count: int,
+        total_photos: int,
+        status: str = "in_progress"
+    ) -> None:
+        """Atomically persists latest progress checkpoint for auto-resume and monitoring."""
+        conn = self._get_connection(self.output_db_path)
+        cur = conn.cursor()
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            cur.execute("""
+            INSERT INTO checkpoints (
+                id, shard_name, last_cafe_id, last_cafe_name, total_processed,
+                matched_count, not_found_count, error_count, total_photos, status, updated_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                shard_name = excluded.shard_name,
+                last_cafe_id = excluded.last_cafe_id,
+                last_cafe_name = excluded.last_cafe_name,
+                total_processed = excluded.total_processed,
+                matched_count = excluded.matched_count,
+                not_found_count = excluded.not_found_count,
+                error_count = excluded.error_count,
+                total_photos = excluded.total_photos,
+                status = excluded.status,
+                updated_at = excluded.updated_at;
+            """, (
+                shard_name, last_cafe_id, last_cafe_name, total_processed,
+                matched_count, not_found_count, error_count, total_photos, status, now_iso
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_checkpoint(self) -> Optional[Dict[str, Any]]:
+        """Retrieves current checkpoint status if present."""
+        if not os.path.exists(self.output_db_path):
+            return None
+        conn = self._get_connection(self.output_db_path, read_only=True)
+        cur = conn.cursor()
+        row = cur.execute("SELECT * FROM checkpoints WHERE id = 1").fetchone()
+        conn.close()
+        return dict(row) if row else None

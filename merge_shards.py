@@ -59,6 +59,22 @@ def merge_databases(shard_db_paths: list[str], output_master_path: str):
     cur_master.execute("CREATE INDEX IF NOT EXISTS idx_photos_cafe ON place_photos(cafe_id);")
     cur_master.execute("CREATE INDEX IF NOT EXISTS idx_photos_owner ON place_photos(is_owner_photo);")
 
+    cur_master.execute("""
+    CREATE TABLE IF NOT EXISTS checkpoints (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        shard_name TEXT,
+        last_cafe_id INTEGER,
+        last_cafe_name TEXT,
+        total_processed INTEGER DEFAULT 0,
+        matched_count INTEGER DEFAULT 0,
+        not_found_count INTEGER DEFAULT 0,
+        error_count INTEGER DEFAULT 0,
+        total_photos INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'in_progress',
+        updated_at TEXT
+    );
+    """)
+
     total_places_merged = 0
     total_photos_merged = 0
 
