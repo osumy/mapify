@@ -46,6 +46,7 @@ def merge_databases(shard_db_paths: list[str], output_master_path: str):
         photo_url TEXT NOT NULL,
         high_res_url TEXT NOT NULL,
         source_type TEXT DEFAULT 'gallery',
+        is_owner_photo INTEGER DEFAULT 0,
         author_name TEXT,
         created_at TEXT,
         UNIQUE(cafe_id, photo_url),
@@ -56,6 +57,7 @@ def merge_databases(shard_db_paths: list[str], output_master_path: str):
     cur_master.execute("CREATE INDEX IF NOT EXISTS idx_places_status ON places(status);")
     cur_master.execute("CREATE INDEX IF NOT EXISTS idx_places_place_id ON places(place_id);")
     cur_master.execute("CREATE INDEX IF NOT EXISTS idx_photos_cafe ON place_photos(cafe_id);")
+    cur_master.execute("CREATE INDEX IF NOT EXISTS idx_photos_owner ON place_photos(is_owner_photo);")
 
     total_places_merged = 0
     total_photos_merged = 0
@@ -75,7 +77,7 @@ def merge_databases(shard_db_paths: list[str], output_master_path: str):
             conn_shard.close()
             continue
 
-        # Merge places
+        # Merge places with priority for 'matched' records
         places = cur_shard.execute("""
         SELECT cafe_id, place_id, cid, fid, kgmid, title, searched_name, searched_lat, searched_lng,
                scraped_lat, scraped_lng, address, status, name_score, distance_meters,
@@ -84,24 +86,55 @@ def merge_databases(shard_db_paths: list[str], output_master_path: str):
         """).fetchall()
 
         cur_master.executemany("""
-        INSERT OR REPLACE INTO places (
+        INSERT INTO places (
             cafe_id, place_id, cid, fid, kgmid, title, searched_name, searched_lat, searched_lng,
             scraped_lat, scraped_lng, address, status, name_score, distance_meters,
             photos_count, search_url, google_maps_url, scraped_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(cafe_id) DO UPDATE SET
+            place_id = COALESCE(excluded.place_id, places.place_id),
+            cid = COALESCE(excluded.cid, places.cid),
+            fid = COALESCE(excluded.fid, places.fid),
+            kgmid = COALESCE(excluded.kgmid, places.kgmid),
+            title = CASE WHEN excluded.status = 'matched' THEN excluded.title ELSE places.title END,
+            status = CASE WHEN places.status = 'matched' THEN 'matched' ELSE excluded.status END,
+            scraped_lat = COALESCE(excluded.scraped_lat, places.scraped_lat),
+            scraped_lng = COALESCE(excluded.scraped_lng, places.scraped_lng),
+            name_score = CASE WHEN excluded.status = 'matched' THEN excluded.name_score ELSE places.name_score END,
+            distance_meters = CASE WHEN excluded.status = 'matched' THEN excluded.distance_meters ELSE places.distance_meters END,
+            photos_count = MAX(places.photos_count, excluded.photos_count),
+            google_maps_url = CASE WHEN excluded.status = 'matched' THEN excluded.google_maps_url ELSE places.google_maps_url END,
+            scraped_at = excluded.scraped_at;
         """, places)
 
-        # Merge place_photos
-        photos = cur_shard.execute("""
-        SELECT cafe_id, photo_url, high_res_url, source_type, author_name, created_at
-        FROM place_photos
-        """).fetchall()
+        # Check if is_owner_photo exists in shard
+        cols = {c[1] for c in cur_shard.execute("PRAGMA table_info(place_photos)").fetchall()}
+        has_owner_col = "is_owner_photo" in cols
 
-        cur_master.executemany("""
-        INSERT OR IGNORE INTO place_photos (
-            cafe_id, photo_url, high_res_url, source_type, author_name, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        """, photos)
+        if has_owner_col:
+            photos = cur_shard.execute("""
+            SELECT cafe_id, photo_url, high_res_url, source_type, is_owner_photo, author_name, created_at
+            FROM place_photos
+            """).fetchall()
+
+            cur_master.executemany("""
+            INSERT INTO place_photos (
+                cafe_id, photo_url, high_res_url, source_type, is_owner_photo, author_name, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cafe_id, photo_url) DO UPDATE SET
+                is_owner_photo = MAX(place_photos.is_owner_photo, excluded.is_owner_photo);
+            """, photos)
+        else:
+            photos = cur_shard.execute("""
+            SELECT cafe_id, photo_url, high_res_url, source_type, author_name, created_at
+            FROM place_photos
+            """).fetchall()
+
+            cur_master.executemany("""
+            INSERT OR IGNORE INTO place_photos (
+                cafe_id, photo_url, high_res_url, source_type, author_name, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """, photos)
 
         conn_master.commit()
         conn_shard.close()
@@ -111,13 +144,16 @@ def merge_databases(shard_db_paths: list[str], output_master_path: str):
         print(f"  [{idx}/{len(shard_db_paths)}] Merged '{p.name}': {len(places)} places, {len(photos)} photos")
 
     final_places = cur_master.execute("SELECT count(*) FROM places").fetchone()[0]
+    final_matched = cur_master.execute("SELECT count(*) FROM places WHERE status = 'matched'").fetchone()[0]
     final_photos = cur_master.execute("SELECT count(*) FROM place_photos").fetchone()[0]
+    final_owner = cur_master.execute("SELECT count(*) FROM place_photos WHERE is_owner_photo = 1").fetchone()[0]
     conn_master.close()
 
     print("=" * 60)
     print("🎉 MERGE COMPLETED SUCCESSFULLY!")
-    print(f"Total Unique Places in Master: {final_places}")
+    print(f"Total Unique Places in Master: {final_places} ({final_matched} matched)")
     print(f"Total Unique Photos in Master: {final_photos}")
+    print(f"Total Owner / Verified Photos: {final_owner} ({round(final_owner/max(1, final_photos)*100, 1)}%)")
     print(f"Master File: {output_master_path}")
     print("=" * 60)
 

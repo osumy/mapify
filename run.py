@@ -35,6 +35,93 @@ def setup_logger(log_dir: Path) -> None:
     )
 
 
+async def run_pipeline(scraper: MapifyScraper, pending_cafes: list, config: ScraperConfig) -> dict:
+    """Executes scraping pipeline across pending cafes with exponential backoff and circuit breaking."""
+    total_to_process = len(pending_cafes)
+    matched_count = 0
+    not_found_count = 0
+    error_count = 0
+    total_photos = 0
+    owner_photos = 0
+    consecutive_rate_limits = 0
+    backoff_delay = 60.0
+
+    pbar = tqdm(total=total_to_process, desc="Harvesting Photos", unit="cafe")
+
+    for idx, cafe in enumerate(pending_cafes, 1):
+        retried = False
+        while True:
+            res = await scraper.scrape_cafe(cafe)
+            status = res.get("status")
+
+            if status == "rate_limited":
+                consecutive_rate_limits += 1
+                logger.warning(f"Rate limited on cafe {cafe.id}! Consecutive hit #{consecutive_rate_limits}")
+                if consecutive_rate_limits >= 3:
+                    logger.critical("Aborting batch: 3 consecutive CAPTCHA / rate-limit responses. Stopping to prevent IP ban.")
+                    pbar.close()
+                    return {
+                        "matched": matched_count,
+                        "not_found": not_found_count,
+                        "errors": error_count,
+                        "photos": total_photos,
+                        "owner_photos": owner_photos,
+                        "rate_limited": True
+                    }
+
+                logger.info(f"Backing off for {backoff_delay}s...")
+                await asyncio.sleep(backoff_delay)
+                backoff_delay = min(backoff_delay * 2.0, 600.0)
+                await scraper._create_new_context()
+
+                if not retried:
+                    retried = True
+                    continue  # Retry the current cafe once after backoff
+                else:
+                    error_count += 1
+                    break
+            else:
+                consecutive_rate_limits = 0
+                backoff_delay = 60.0
+
+                if status == "matched":
+                    matched_count += 1
+                    photos = res.get("photos", [])
+                    total_photos += len(photos)
+                    owner_photos += sum(1 for p in photos if p.get("is_owner_photo") == 1)
+                elif status == "not_found":
+                    not_found_count += 1
+                else:
+                    error_count += 1
+                break
+
+        pbar.update(1)
+        pbar.set_postfix({
+            "matched": matched_count,
+            "not_found": not_found_count,
+            "errors": error_count,
+            "photos": total_photos,
+            "owner": owner_photos
+        })
+
+        if idx < total_to_process:
+            if idx % config.CAFES_PER_BATCH == 0:
+                logger.info(f"Batch checkpoint reached ({idx}/{total_to_process}). Cooldown {config.BATCH_COOLDOWN_SECONDS}s...")
+                await asyncio.sleep(config.BATCH_COOLDOWN_SECONDS)
+            else:
+                await scraper._safe_delay()
+
+    pbar.close()
+    return {
+        "matched": matched_count,
+        "not_found": not_found_count,
+        "errors": error_count,
+        "photos": total_photos,
+        "owner_photos": owner_photos,
+        "rate_limited": False
+    }
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Mapify: Google Maps Cafe Photo Scraper")
     parser.add_argument("--limit", type=int, default=None, help="Number of pending cafes to process (default: all)")
@@ -96,53 +183,30 @@ async def main():
     scraper = MapifyScraper(config=config, db_manager=db)
     await scraper.start()
 
-    matched_count = 0
-    not_found_count = 0
-    total_photos_harvested = 0
-
-    pbar = tqdm(total=total_to_process, desc="Harvesting Photos", unit="cafe")
-
     try:
-        for idx, cafe in enumerate(pending_cafes, 1):
-            res = await scraper.scrape_cafe(cafe)
-            status = res.get("status")
-            photos = res.get("photos", [])
-
-            if status == "matched":
-                matched_count += 1
-                total_photos_harvested += len(photos)
-            else:
-                not_found_count += 1
-
-            pbar.update(1)
-            pbar.set_postfix({
-                "matched": matched_count,
-                "not_found": not_found_count,
-                "photos": total_photos_harvested
-            })
-
-            # Check if batch cooldown is needed
-            if idx < total_to_process:
-                if idx % config.CAFES_PER_BATCH == 0:
-                    logger.info(f"Batch checkpoint reached ({idx}/{total_to_process}). Cooling down for {config.BATCH_COOLDOWN_SECONDS}s...")
-                    await asyncio.sleep(config.BATCH_COOLDOWN_SECONDS)
-                else:
-                    await scraper._safe_delay()
-
+        stats = await run_pipeline(scraper=scraper, pending_cafes=pending_cafes, config=config)
     except KeyboardInterrupt:
         logger.warning("Process interrupted by user (Ctrl+C). Saving and shutting down gracefully...")
+        stats = {}
     finally:
-        pbar.close()
         await scraper.close()
 
     logger.info("=" * 60)
     logger.info("📊 SESSION SUMMARY")
-    logger.info(f"Total Processed: {matched_count + not_found_count}/{total_to_process}")
-    logger.info(f"Successfully Matched: {matched_count}")
-    logger.info(f"Not Found / Rejected: {not_found_count}")
-    logger.info(f"Total High-Res Photos Harvested: {total_photos_harvested}")
-    if matched_count > 0:
-        logger.info(f"Average Photos per Cafe: {total_photos_harvested / matched_count:.1f}")
+    matched = stats.get("matched", 0)
+    not_found = stats.get("not_found", 0)
+    errors = stats.get("errors", 0)
+    total_photos = stats.get("photos", 0)
+    owner_photos = stats.get("owner_photos", 0)
+    logger.info(f"Total Processed: {matched + not_found + errors}/{total_to_process}")
+    logger.info(f"Successfully Matched: {matched}")
+    logger.info(f"Not Found / Rejected: {not_found}")
+    logger.info(f"Errors: {errors}")
+    logger.info(f"Total High-Res Photos Harvested: {total_photos}")
+    logger.info(f"Owner / Verified Photos: {owner_photos} ({round(owner_photos/max(1, total_photos)*100, 1)}%)")
+    logger.info(f"Customer / UGC Photos: {total_photos - owner_photos}")
+    if matched > 0:
+        logger.info(f"Average Photos per Cafe: {total_photos / matched:.1f}")
     logger.info(f"Results stored in: {config.OUTPUT_DB_PATH}")
     logger.info("=" * 60)
 
