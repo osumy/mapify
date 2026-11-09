@@ -170,12 +170,13 @@ async def run_pipeline(
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Mapify: Google Maps Cafe Photo Scraper")
+    default_source = "data/merged_cafe_photos_matched.db" if Path("data/merged_cafe_photos_matched.db").exists() else r"c:\Users\amira\Desktop\DB\v3\1405-08-12-cafochino.db"
+    parser = argparse.ArgumentParser(description="Mapify: Google Maps Cafe Photo & Metadata Harvester")
     parser.add_argument("--limit", type=int, default=None, help="Number of pending cafes to process (default: all)")
     parser.add_argument("--headless", action="store_true", default=True, help="Run browser in headless mode (default: True)")
     parser.add_argument("--headful", dest="headless", action="store_false", help="Run browser in visible UI mode")
     parser.add_argument("--batch-size", type=int, default=35, help="Number of cafes per batch before cooldown")
-    parser.add_argument("--source-db", type=str, default=r"c:\Users\amira\Desktop\DB\v3\1405-08-12-cafochino.db", help="Path to source cafochino.db")
+    parser.add_argument("--source-db", type=str, default=default_source, help="Path to source db (default: merged_cafe_photos_matched.db)")
     parser.add_argument("--output-db", type=str, default=None, help="Path to output cafe_photos.db")
     parser.add_argument("--delay-min", type=float, default=4.5, help="Minimum randomized delay per cafe (seconds)")
     parser.add_argument("--delay-max", type=float, default=8.5, help="Maximum randomized delay per cafe (seconds)")
@@ -213,7 +214,7 @@ async def main():
     total_to_process = len(pending_cafes)
 
     logger.info("=" * 60)
-    logger.info("🚀 MAPIFY: GOOGLE MAPS CAFE PHOTO SCRAPER")
+    logger.info("🚀 MAPIFY: GOOGLE MAPS CAFE PHOTO & EXTENDED METADATA HARVESTER")
     logger.info(f"Source Database: {config.SOURCE_DB_PATH}")
     logger.info(f"Output Database: {config.OUTPUT_DB_PATH}")
     if args.total_shards and args.shard_id:

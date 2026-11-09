@@ -1,7 +1,8 @@
-"""Database layer for Mapify: reads source cafes and persists scraped photo data."""
+"""Database layer for Mapify: reads source cafes and persists scraped photo data & extended metadata."""
 
 import base64
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import re
@@ -23,6 +24,7 @@ class CafeRecord:
     phone: Optional[str] = None
     instagram: Optional[str] = None
     website: Optional[str] = None
+    google_maps_url: Optional[str] = None
 
     @property
     def has_coordinates(self) -> bool:
@@ -61,8 +63,8 @@ def extract_place_identifiers(url: str) -> Dict[str, Optional[str]]:
         except Exception:
             pass
 
-    # 2. Match direct place_id query param if present
-    m_pid = re.search(r"[?&](?:query_place_id|place_id)=([a-zA-Z0-9_\-]+)", url)
+    # 2. Match direct place_id param if present (e.g. ?place_id=... or ?q=place_id:...)
+    m_pid = re.search(r"(?:[?&](?:query_place_id|place_id)=|place_id:)([a-zA-Z0-9_\-]+)", url)
     if m_pid and not ids["place_id"]:
         ids["place_id"] = m_pid.group(1)
 
@@ -101,11 +103,11 @@ class DatabaseManager:
         return conn
 
     def _init_output_db(self) -> None:
-        """Create output tables and indices for venues and photos."""
+        """Create output tables and indices for venues, metadata, and photos."""
         conn = self._get_connection(self.output_db_path)
         cur = conn.cursor()
 
-        # Table for matched/scraped places
+        # Table for matched/scraped places with comprehensive Level 1 metadata
         cur.execute("""
         CREATE TABLE IF NOT EXISTS places (
             cafe_id INTEGER PRIMARY KEY,
@@ -114,12 +116,27 @@ class DatabaseManager:
             fid TEXT,
             kgmid TEXT,
             title TEXT,
+            category_name TEXT,
             searched_name TEXT,
             searched_lat REAL,
             searched_lng REAL,
             scraped_lat REAL,
             scraped_lng REAL,
             address TEXT,
+            phone TEXT,
+            phone_unformatted TEXT,
+            website TEXT,
+            total_score REAL,
+            reviews_count INTEGER,
+            plus_code TEXT,
+            is_claimed INTEGER,
+            is_permanently_closed INTEGER DEFAULT 0,
+            is_temporarily_closed INTEGER DEFAULT 0,
+            price_level TEXT,
+            located_in TEXT,
+            menu_url TEXT,
+            opening_hours TEXT,
+            popular_times TEXT,
             status TEXT,                -- 'matched', 'not_found', 'error'
             name_score REAL,
             distance_meters REAL,
@@ -148,9 +165,29 @@ class DatabaseManager:
 
         # Migrations: ensure columns exist in existing output database
         places_cols = {c["name"] for c in cur.execute("PRAGMA table_info(places)").fetchall()}
-        for col in ["cid", "fid", "kgmid"]:
+        new_cols = {
+            "cid": "TEXT",
+            "fid": "TEXT",
+            "kgmid": "TEXT",
+            "category_name": "TEXT",
+            "phone": "TEXT",
+            "phone_unformatted": "TEXT",
+            "website": "TEXT",
+            "total_score": "REAL",
+            "reviews_count": "INTEGER",
+            "plus_code": "TEXT",
+            "is_claimed": "INTEGER",
+            "is_permanently_closed": "INTEGER DEFAULT 0",
+            "is_temporarily_closed": "INTEGER DEFAULT 0",
+            "price_level": "TEXT",
+            "located_in": "TEXT",
+            "menu_url": "TEXT",
+            "opening_hours": "TEXT",
+            "popular_times": "TEXT",
+        }
+        for col, col_type in new_cols.items():
             if col not in places_cols:
-                cur.execute(f"ALTER TABLE places ADD COLUMN {col} TEXT;")
+                cur.execute(f"ALTER TABLE places ADD COLUMN {col} {col_type};")
 
         photo_cols = {c["name"] for c in cur.execute("PRAGMA table_info(place_photos)").fetchall()}
         if "is_owner_photo" not in photo_cols:
@@ -183,10 +220,25 @@ class DatabaseManager:
         conn.close()
 
     def get_already_processed_ids(self) -> Set[int]:
-        """Returns set of cafe IDs already resolved as matched or not_found (transient errors can be retried)."""
+        """Returns set of cafe IDs already resolved in output database."""
+        if not os.path.exists(self.output_db_path):
+            return set()
         conn = self._get_connection(self.output_db_path, read_only=True)
         cur = conn.cursor()
-        rows = cur.execute("SELECT cafe_id FROM places WHERE status IN ('matched', 'not_found')").fetchall()
+
+        t_check = cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='places'").fetchone()
+        if not t_check:
+            conn.close()
+            return set()
+
+        cols = {c["name"] for c in cur.execute("PRAGMA table_info(places)").fetchall()}
+
+        # If running in-place (source == output) and category_name exists, only count items where metadata was extracted
+        if os.path.abspath(self.source_db_path) == os.path.abspath(self.output_db_path) and "category_name" in cols:
+            rows = cur.execute("SELECT cafe_id FROM places WHERE category_name IS NOT NULL OR status = 'not_found'").fetchall()
+        else:
+            rows = cur.execute("SELECT cafe_id FROM places WHERE status IN ('matched', 'not_found')").fetchall()
+
         processed = {r["cafe_id"] for r in rows}
         conn.close()
         return processed
@@ -201,60 +253,108 @@ class DatabaseManager:
     ) -> List[CafeRecord]:
         """
         Loads cafes from source database that haven't been scraped yet.
-        Supports sharding across multiple workers/notebooks.
+        Supports:
+        1. Pre-matched database format (table 'places' with canonical 'google_maps_url')
+        2. Original source database format (table 'cafes_cafe')
         """
         processed_ids = self.get_already_processed_ids()
         conn = self._get_connection(self.source_db_path, read_only=True)
         cur = conn.cursor()
 
-        query = """
-        SELECT id, name, latitude, longitude, city, address, phone, instagram, website
-        FROM cafes_cafe
-        WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-        ORDER BY id ASC
-        """
-        rows = cur.execute(query).fetchall()
-        conn.close()
+        tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 
         pending = []
-        for r in rows:
-            cid = r["id"]
-            if cid in processed_ids:
-                continue
+        if "places" in tables:
+            query = """
+            SELECT cafe_id AS id, COALESCE(title, searched_name) AS name,
+                   COALESCE(scraped_lat, searched_lat) AS latitude,
+                   COALESCE(scraped_lng, searched_lng) AS longitude,
+                   address, google_maps_url
+            FROM places
+            WHERE (status = 'matched' OR status IS NULL)
+            ORDER BY cafe_id ASC
+            """
+            rows = cur.execute(query).fetchall()
+            conn.close()
 
-            # ID Range filter
-            if start_id is not None and cid < start_id:
-                continue
-            if end_id is not None and cid > end_id:
-                continue
-
-            # Modulo sharding filter (if specified on a non-presplit database)
-            if total_shards and shard_id:
-                if (cid % total_shards) != (shard_id - 1):
+            for r in rows:
+                cid = r["id"]
+                if cid in processed_ids:
                     continue
 
-            pending.append(CafeRecord(
-                id=cid,
-                name=r["name"],
-                latitude=float(r["latitude"]),
-                longitude=float(r["longitude"]),
-                city=r["city"],
-                address=r["address"],
-                phone=r["phone"],
-                instagram=r["instagram"],
-                website=r["website"]
-            ))
+                if start_id is not None and cid < start_id:
+                    continue
+                if end_id is not None and cid > end_id:
+                    continue
 
-            if limit and len(pending) >= limit:
-                break
+                if total_shards and shard_id:
+                    if (cid % total_shards) != (shard_id - 1):
+                        continue
 
-        return pending
+                pending.append(CafeRecord(
+                    id=cid,
+                    name=r["name"],
+                    latitude=float(r["latitude"]) if r["latitude"] is not None else 0.0,
+                    longitude=float(r["longitude"]) if r["longitude"] is not None else 0.0,
+                    address=r["address"],
+                    google_maps_url=r["google_maps_url"]
+                ))
+
+                if limit and len(pending) >= limit:
+                    break
+
+            return pending
+
+        elif "cafes_cafe" in tables:
+            query = """
+            SELECT id, name, latitude, longitude, city, address, phone, instagram, website
+            FROM cafes_cafe
+            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+            ORDER BY id ASC
+            """
+            rows = cur.execute(query).fetchall()
+            conn.close()
+
+            for r in rows:
+                cid = r["id"]
+                if cid in processed_ids:
+                    continue
+
+                if start_id is not None and cid < start_id:
+                    continue
+                if end_id is not None and cid > end_id:
+                    continue
+
+                if total_shards and shard_id:
+                    if (cid % total_shards) != (shard_id - 1):
+                        continue
+
+                pending.append(CafeRecord(
+                    id=cid,
+                    name=r["name"],
+                    latitude=float(r["latitude"]),
+                    longitude=float(r["longitude"]),
+                    city=r["city"],
+                    address=r["address"],
+                    phone=r["phone"],
+                    instagram=r["instagram"],
+                    website=r["website"]
+                ))
+
+                if limit and len(pending) >= limit:
+                    break
+
+            return pending
+        else:
+            conn.close()
+            raise ValueError(f"Source database at '{self.source_db_path}' contains neither 'places' nor 'cafes_cafe' table.")
 
     def save_place_and_photos(
         self,
         cafe: CafeRecord,
         status: str,
         title: Optional[str] = None,
+        category_name: Optional[str] = None,
         place_id: Optional[str] = None,
         cid: Optional[str] = None,
         fid: Optional[str] = None,
@@ -262,22 +362,44 @@ class DatabaseManager:
         scraped_lat: Optional[float] = None,
         scraped_lng: Optional[float] = None,
         address: Optional[str] = None,
+        phone: Optional[str] = None,
+        phone_unformatted: Optional[str] = None,
+        website: Optional[str] = None,
+        total_score: Optional[float] = None,
+        reviews_count: Optional[int] = None,
+        plus_code: Optional[str] = None,
+        is_claimed: Optional[bool] = None,
+        is_permanently_closed: bool = False,
+        is_temporarily_closed: bool = False,
+        price_level: Optional[str] = None,
+        located_in: Optional[str] = None,
+        menu_url: Optional[str] = None,
+        opening_hours: Optional[Any] = None,
+        popular_times: Optional[Any] = None,
         name_score: float = 0.0,
         distance_meters: Optional[float] = None,
         search_url: str = "",
         google_maps_url: Optional[str] = None,
         photos: Optional[List[Dict[str, Any]]] = None
     ) -> None:
-        """Atomically saves a place record and all its associated photos with complete Google IDs and owner tags."""
+        """Atomically saves a place record with extended Level 1 metadata and all associated photos."""
         photos = photos or []
 
         # Auto-extract identifiers from google_maps_url if not explicitly provided
-        if google_maps_url and not place_id:
-            extracted = extract_place_identifiers(google_maps_url)
+        target_url = google_maps_url or cafe.google_maps_url
+        if target_url and not place_id:
+            extracted = extract_place_identifiers(target_url)
             place_id = place_id or extracted.get("place_id")
             cid = cid or extracted.get("cid")
             fid = fid or extracted.get("fid")
             kgmid = kgmid or extracted.get("kgmid")
+
+        if opening_hours is not None and not isinstance(opening_hours, str):
+            opening_hours = json.dumps(opening_hours, ensure_ascii=False)
+        if popular_times is not None and not isinstance(popular_times, str):
+            popular_times = json.dumps(popular_times, ensure_ascii=False)
+
+        is_claimed_int = int(is_claimed) if is_claimed is not None else None
 
         conn = self._get_connection(self.output_db_path)
         cur = conn.cursor()
@@ -286,29 +408,64 @@ class DatabaseManager:
         try:
             cur.execute("""
             INSERT INTO places (
-                cafe_id, place_id, cid, fid, kgmid, title, searched_name, searched_lat, searched_lng,
-                scraped_lat, scraped_lng, address, status, name_score, distance_meters,
-                photos_count, search_url, google_maps_url, scraped_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cafe_id, place_id, cid, fid, kgmid, title, category_name,
+                searched_name, searched_lat, searched_lng, scraped_lat, scraped_lng,
+                address, phone, phone_unformatted, website,
+                total_score, reviews_count, plus_code, is_claimed,
+                is_permanently_closed, is_temporarily_closed, price_level,
+                located_in, menu_url, opening_hours, popular_times,
+                status, name_score, distance_meters, photos_count,
+                search_url, google_maps_url, scraped_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?
+            )
             ON CONFLICT(cafe_id) DO UPDATE SET
                 place_id = COALESCE(excluded.place_id, places.place_id),
                 cid = COALESCE(excluded.cid, places.cid),
                 fid = COALESCE(excluded.fid, places.fid),
                 kgmid = COALESCE(excluded.kgmid, places.kgmid),
                 title = CASE WHEN excluded.status = 'matched' THEN excluded.title ELSE places.title END,
-                status = CASE WHEN places.status = 'matched' THEN 'matched' ELSE excluded.status END,
+                category_name = COALESCE(excluded.category_name, places.category_name),
                 scraped_lat = COALESCE(excluded.scraped_lat, places.scraped_lat),
                 scraped_lng = COALESCE(excluded.scraped_lng, places.scraped_lng),
+                address = COALESCE(excluded.address, places.address),
+                phone = COALESCE(excluded.phone, places.phone),
+                phone_unformatted = COALESCE(excluded.phone_unformatted, places.phone_unformatted),
+                website = COALESCE(excluded.website, places.website),
+                total_score = COALESCE(excluded.total_score, places.total_score),
+                reviews_count = COALESCE(excluded.reviews_count, places.reviews_count),
+                plus_code = COALESCE(excluded.plus_code, places.plus_code),
+                is_claimed = COALESCE(excluded.is_claimed, places.is_claimed),
+                is_permanently_closed = COALESCE(excluded.is_permanently_closed, places.is_permanently_closed),
+                is_temporarily_closed = COALESCE(excluded.is_temporarily_closed, places.is_temporarily_closed),
+                price_level = COALESCE(excluded.price_level, places.price_level),
+                located_in = COALESCE(excluded.located_in, places.located_in),
+                menu_url = COALESCE(excluded.menu_url, places.menu_url),
+                opening_hours = COALESCE(excluded.opening_hours, places.opening_hours),
+                popular_times = COALESCE(excluded.popular_times, places.popular_times),
+                status = CASE WHEN places.status = 'matched' THEN 'matched' ELSE excluded.status END,
                 name_score = CASE WHEN excluded.status = 'matched' THEN excluded.name_score ELSE places.name_score END,
                 distance_meters = CASE WHEN excluded.status = 'matched' THEN excluded.distance_meters ELSE places.distance_meters END,
                 photos_count = MAX(places.photos_count, excluded.photos_count),
                 google_maps_url = CASE WHEN excluded.status = 'matched' THEN excluded.google_maps_url ELSE places.google_maps_url END,
                 scraped_at = excluded.scraped_at;
             """, (
-                cafe.id, place_id, cid, fid, kgmid, title or cafe.name, cafe.name, cafe.latitude, cafe.longitude,
-                scraped_lat, scraped_lng, address, status, round(name_score, 2),
+                cafe.id, place_id, cid, fid, kgmid, title or cafe.name, category_name,
+                cafe.name, cafe.latitude, cafe.longitude, scraped_lat, scraped_lng,
+                address or cafe.address, phone or cafe.phone, phone_unformatted, website or cafe.website,
+                total_score, reviews_count, plus_code, is_claimed_int,
+                int(is_permanently_closed), int(is_temporarily_closed), price_level,
+                located_in, menu_url, opening_hours, popular_times,
+                status, round(name_score, 2),
                 round(distance_meters, 1) if distance_meters is not None else None,
-                len(photos), search_url, google_maps_url, now_iso
+                len(photos), search_url, target_url, now_iso
             ))
 
             for p in photos:

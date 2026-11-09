@@ -1,4 +1,4 @@
-"""Hardened Playwright scraper orchestrator for Mapify."""
+"""Hardened Playwright scraper orchestrator for Mapify with extended metadata extraction."""
 
 import asyncio
 import random
@@ -12,6 +12,7 @@ from playwright_stealth import Stealth
 
 from src.config import ScraperConfig
 from src.db import CafeRecord, DatabaseManager
+from src.extractor import extract_place_metadata
 from src.interceptor import PhotoInterceptor
 from src.matcher import evaluate_candidate, haversine_distance, MatchResult
 
@@ -198,7 +199,7 @@ class MapifyScraper:
         return "not_found"
 
     async def scrape_cafe(self, cafe: CafeRecord) -> Dict[str, Any]:
-        """Scrapes photos and details for a single cafe record."""
+        """Scrapes photos and extended metadata for a single cafe record."""
         await self._ensure_browser_alive()
         self.requests_in_context += 1
         self.total_places_processed += 1
@@ -208,6 +209,25 @@ class MapifyScraper:
             await self._create_new_context()
 
         self.interceptor.clear()
+
+        # If canonical google_maps_url is already known, navigate directly (fast, zero search overhead)
+        if cafe.google_maps_url and "/maps/place/" in cafe.google_maps_url:
+            try:
+                return await self._handle_direct_url(cafe, cafe.google_maps_url)
+            except Error as e:
+                if "target closed" in str(e).lower() or "connection closed" in str(e).lower():
+                    logger.warning("Browser target closed. Triggering recovery...")
+                    await self._create_new_context()
+                    return {"status": "error", "error": "TargetClosedError", "photos": []}
+                logger.error(f"Playwright error on direct place '{cafe.name}' ({cafe.id}): {e}")
+                self.db.save_place_and_photos(cafe=cafe, status="error", search_url=cafe.google_maps_url)
+                return {"status": "error", "error": str(e), "photos": []}
+            except Exception as e:
+                logger.error(f"Error on direct place '{cafe.name}' ({cafe.id}): {e}")
+                self.db.save_place_and_photos(cafe=cafe, status="error", search_url=cafe.google_maps_url)
+                return {"status": "error", "error": str(e), "photos": []}
+
+        # Otherwise, fall back to geo search query
         search_url = self.build_search_url(cafe)
         logger.info(f"[{cafe.id}] Searching for '{cafe.name}' in {cafe.city or 'Iran'}...")
 
@@ -254,9 +274,94 @@ class MapifyScraper:
             )
             return {"status": "error", "error": str(e), "photos": []}
 
+    @staticmethod
+    def get_clean_place_url(url: str) -> str:
+        """Returns clean Google Maps place overview URL, stripping any photo viewer parameters."""
+        if not url:
+            return ""
+        from src.db import extract_place_identifiers
+        ids = extract_place_identifiers(url)
+        if ids.get("place_id"):
+            return f"https://www.google.com/maps/place/?q=place_id:{ids['place_id']}&hl=fa"
+        # Fallback: strip photo modal / streetview params if present
+        clean = re.sub(r",3a,[^/]+", "", url)
+        clean = re.sub(r"/data=![0-9a-zA-Z!_.-]+", "", clean)
+        return clean
+
+    async def _handle_direct_url(self, cafe: CafeRecord, target_url: str) -> Dict[str, Any]:
+        """Directly loads canonical place URL, extracting Level 1 metadata and photos with zero search overhead."""
+        clean_url = self.get_clean_place_url(target_url)
+        logger.info(f"[{cafe.id}] Direct navigating to '{cafe.name}'...")
+        resp = await self.page.goto(clean_url, wait_until="domcontentloaded", timeout=self.config.PAGE_TIMEOUT_MS)
+        if resp and resp.status in (429, 503):
+            logger.warning(f"HTTP {resp.status} Rate Limit encountered on '{cafe.name}'!")
+            return {"status": "rate_limited", "photos": []}
+
+        signal = await self._wait_for_page_signal(max_wait_seconds=7.5)
+        current_url = self.page.url
+
+        if signal == "captcha" or "google.com/sorry" in current_url:
+            logger.warning(f"Rate-limit / CAPTCHA detected on '{cafe.name}'! URL: {current_url}")
+            return {"status": "rate_limited", "photos": []}
+
+        # Wait briefly for overview pane hydration
+        await self.page.wait_for_timeout(self.config.SETTLE_WAIT_MS)
+
+        metadata = await extract_place_metadata(self.page)
+        title = metadata.get("title") or await self._get_h1_title() or cafe.name
+        lat, lng = self._extract_coords_from_url(current_url)
+        if lat is None or lng is None:
+            lat, lng = cafe.latitude, cafe.longitude
+
+        logger.success(f"Loaded '{cafe.name}' -> '{title}' ({metadata.get('category_name') or 'N/A'}, score={metadata.get('total_score')}, revs={metadata.get('reviews_count')})")
+
+        photos = await self._harvest_photos(venue_title=title)
+        owner_photos_count = sum(1 for p in photos if p.get("is_owner_photo") == 1)
+        logger.info(f"Harvested {len(photos)} photos ({owner_photos_count} owner) for '{cafe.name}'.")
+
+        from src.db import extract_place_identifiers
+        ids = extract_place_identifiers(cafe.google_maps_url or target_url)
+
+        self.db.save_place_and_photos(
+            cafe=cafe,
+            status="matched",
+            title=title,
+            category_name=metadata.get("category_name"),
+            place_id=ids.get("place_id"),
+            cid=ids.get("cid"),
+            fid=ids.get("fid"),
+            kgmid=ids.get("kgmid"),
+            scraped_lat=lat,
+            scraped_lng=lng,
+            address=metadata.get("address") or cafe.address,
+            phone=metadata.get("phone") or cafe.phone,
+            phone_unformatted=metadata.get("phone_unformatted"),
+            website=metadata.get("website") or cafe.website,
+            total_score=metadata.get("total_score"),
+            reviews_count=metadata.get("reviews_count"),
+            plus_code=metadata.get("plus_code"),
+            is_claimed=metadata.get("is_claimed"),
+            is_permanently_closed=metadata.get("is_permanently_closed", False),
+            is_temporarily_closed=metadata.get("is_temporarily_closed", False),
+            price_level=metadata.get("price_level"),
+            located_in=metadata.get("located_in"),
+            menu_url=metadata.get("menu_url"),
+            opening_hours=metadata.get("opening_hours"),
+            popular_times=metadata.get("popular_times"),
+            name_score=1.0,
+            distance_meters=0.0,
+            search_url="",
+            google_maps_url=current_url if "/maps/place/" in current_url else target_url,
+            photos=photos
+        )
+
+        return {"status": "matched", "title": title, "metadata": metadata, "photos": photos}
+
     async def _handle_direct_place_page(self, cafe: CafeRecord, search_url: str, place_url: str) -> Dict[str, Any]:
-        """Handles when Google Maps navigated directly to a single place page."""
-        title = await self._get_h1_title()
+        """Handles when Google Maps navigated directly to a single place page via geo search."""
+        await self.page.wait_for_timeout(self.config.SETTLE_WAIT_MS)
+        metadata = await extract_place_metadata(self.page)
+        title = metadata.get("title") or await self._get_h1_title() or cafe.name
         lat, lng = self._extract_coords_from_url(place_url)
 
         match = evaluate_candidate(
@@ -286,16 +391,39 @@ class MapifyScraper:
             return {"status": "not_found", "photos": []}
 
         logger.success(f"Matched '{cafe.name}' -> '{title}' ({match.distance_meters:.1f}m, score={match.composite_score})")
-        photos = await self._harvest_photos(venue_title=title or cafe.name)
+        photos = await self._harvest_photos(venue_title=title)
         owner_photos_count = sum(1 for p in photos if p.get("is_owner_photo") == 1)
-        logger.info(f"Harvested {len(photos)} photos ({owner_photos_count} owner/cover photos) for '{cafe.name}'.")
+        logger.info(f"Harvested {len(photos)} photos ({owner_photos_count} owner) for '{cafe.name}'.")
+
+        from src.db import extract_place_identifiers
+        ids = extract_place_identifiers(cafe.google_maps_url or target_url)
 
         self.db.save_place_and_photos(
             cafe=cafe,
             status="matched",
             title=title,
+            category_name=metadata.get("category_name"),
+            place_id=ids.get("place_id"),
+            cid=ids.get("cid"),
+            fid=ids.get("fid"),
+            kgmid=ids.get("kgmid"),
             scraped_lat=lat,
             scraped_lng=lng,
+            address=metadata.get("address") or cafe.address,
+            phone=metadata.get("phone") or cafe.phone,
+            phone_unformatted=metadata.get("phone_unformatted"),
+            website=metadata.get("website") or cafe.website,
+            total_score=metadata.get("total_score"),
+            reviews_count=metadata.get("reviews_count"),
+            plus_code=metadata.get("plus_code"),
+            is_claimed=metadata.get("is_claimed"),
+            is_permanently_closed=metadata.get("is_permanently_closed", False),
+            is_temporarily_closed=metadata.get("is_temporarily_closed", False),
+            price_level=metadata.get("price_level"),
+            located_in=metadata.get("located_in"),
+            menu_url=metadata.get("menu_url"),
+            opening_hours=metadata.get("opening_hours"),
+            popular_times=metadata.get("popular_times"),
             name_score=match.name_score,
             distance_meters=match.distance_meters,
             search_url=search_url,
@@ -303,7 +431,7 @@ class MapifyScraper:
             photos=photos
         )
 
-        return {"status": "matched", "title": title, "photos": photos}
+        return {"status": "matched", "title": title, "metadata": metadata, "photos": photos}
 
     async def _handle_search_feed_page(self, cafe: CafeRecord, search_url: str) -> Dict[str, Any]:
         """Handles multi-result search feed by evaluating top candidates within 300m."""
@@ -365,25 +493,43 @@ class MapifyScraper:
             except Exception:
                 pass
 
-        title = await self._get_h1_title() or best_candidate["title"]
+        await self.page.wait_for_timeout(self.config.SETTLE_WAIT_MS)
+        metadata = await extract_place_metadata(self.page)
+        title = metadata.get("title") or await self._get_h1_title() or best_candidate["title"]
         photos = await self._harvest_photos(venue_title=title)
         canonical_url = self.page.url if "/maps/place/" in self.page.url else best_candidate["href"]
         owner_photos_count = sum(1 for p in photos if p.get("is_owner_photo") == 1)
-        logger.info(f"Harvested {len(photos)} photos ({owner_photos_count} owner/cover photos) for '{cafe.name}'.")
+        logger.info(f"Harvested {len(photos)} photos ({owner_photos_count} owner) for '{cafe.name}'.")
 
         self.db.save_place_and_photos(
             cafe=cafe,
             status="matched",
             title=title,
+            category_name=metadata.get("category_name"),
             scraped_lat=best_candidate["lat"],
             scraped_lng=best_candidate["lng"],
+            address=metadata.get("address") or cafe.address,
+            phone=metadata.get("phone") or cafe.phone,
+            phone_unformatted=metadata.get("phone_unformatted"),
+            website=metadata.get("website") or cafe.website,
+            total_score=metadata.get("total_score"),
+            reviews_count=metadata.get("reviews_count"),
+            plus_code=metadata.get("plus_code"),
+            is_claimed=metadata.get("is_claimed"),
+            is_permanently_closed=metadata.get("is_permanently_closed", False),
+            is_temporarily_closed=metadata.get("is_temporarily_closed", False),
+            price_level=metadata.get("price_level"),
+            located_in=metadata.get("located_in"),
+            menu_url=metadata.get("menu_url"),
+            opening_hours=metadata.get("opening_hours"),
+            popular_times=metadata.get("popular_times"),
             name_score=best_match.name_score,
             distance_meters=best_match.distance_meters,
             search_url=search_url,
             google_maps_url=canonical_url,
             photos=photos
         )
-        return {"status": "matched", "title": title, "photos": photos}
+        return {"status": "matched", "title": title, "metadata": metadata, "photos": photos}
 
     async def _harvest_photos(self, venue_title: Optional[str] = None) -> List[Dict[str, Any]]:
         """Harvests photos and distinguishes owner uploads from public uploads."""
@@ -424,7 +570,6 @@ class MapifyScraper:
     async def _trigger_photo_drawer(self) -> None:
         """Clicks on photos tab or hero image, checks for Owner tab, and triggers pagination RPCs."""
         try:
-            # Try finding the photos tab or hero header button
             photo_btn = self.page.locator(
                 "button[role='tab'][aria-label*='عکس'], button[role='tab'][aria-label*='Photo'], "
                 "button[role='tab'][aria-label*='Photos'], button.AoCdqe, button[aria-label*='عکس'], "
@@ -486,7 +631,6 @@ class MapifyScraper:
 
     @staticmethod
     def _extract_coords_from_url(url: str) -> Tuple[Optional[float], Optional[float]]:
-        # Prioritize exact place pin (!3d...!4d...) over camera viewport (/@...)
         m_pin = RE_PIN_COORDS.search(url)
         if m_pin:
             return float(m_pin.group(1)), float(m_pin.group(2))

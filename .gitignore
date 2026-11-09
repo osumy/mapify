@@ -36,6 +36,7 @@ venv/
 *.sqlite3
 data/*.db
 data/*.sqlite
+data/shards/
 
 # Logs
 logs/
