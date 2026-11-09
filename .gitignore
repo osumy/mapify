@@ -37,6 +37,8 @@ venv/
 data/*.db
 data/*.sqlite
 data/shards/
+kaggle_staging/
+kaggle_output_shards/
 
 # Logs
 logs/
