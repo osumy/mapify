@@ -73,6 +73,12 @@ def main():
     elif args.action == "download":
         downloaded_dbs = []
         for i in range(1, total_shards + 1):
+            renamed_db = output_base / f"scraped_meta_shard_{i}.db"
+            if renamed_db.exists() and renamed_db.stat().st_size > 100000:
+                print(f"⏩ Shard {i} already downloaded locally: {renamed_db}")
+                downloaded_dbs.append(str(renamed_db))
+                continue
+
             kid = f"{KAGGLE_USERNAME}/mapify-meta-shard{i}"
             st = statuses.get(i, "")
             if "COMPLETE" in st:
@@ -82,7 +88,6 @@ def main():
                 if success:
                     # Rename to distinct shard db
                     src_db = target_dir / "cafe_photos.db"
-                    renamed_db = output_base / f"scraped_meta_shard_{i}.db"
                     import shutil
                     shutil.copy2(src_db, renamed_db)
                     downloaded_dbs.append(str(renamed_db))
