@@ -26,16 +26,29 @@ wheels/
 
 # Virtual Environments
 .env
+.env.*
 .venv/
 env/
 venv/
 
-# Database files
+# Archives & compressed dumps
+*.rar
+*.zip
+*.7z
+*.tar.gz
+*.tar
+*.gz
+
+# Database files & data dumps
 *.db
 *.sqlite
 *.sqlite3
 data/*.db
 data/*.sqlite
+data/*.json
+data/*.csv
+data/*.xlsx
+data/*.parquet
 data/shards/
 kaggle_staging/
 kaggle_output_shards/

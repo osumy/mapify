@@ -7,13 +7,15 @@ import subprocess
 import sys
 import time
 
-KAGGLE_USERNAME = "amiraliaraghi"
-API_TOKEN = "KGAT_836740cc96f6d44b36bc678c98af8889"
+KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "amiraliaraghi")
+API_TOKEN = os.environ.get("KAGGLE_API_TOKEN") or os.environ.get("KAGGLE_KEY", "")
 PYTHON_BIN = sys.executable
 
 def set_kaggle_env():
-    os.environ["KAGGLE_API_TOKEN"] = API_TOKEN
-    os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
+    if API_TOKEN:
+        os.environ["KAGGLE_API_TOKEN"] = API_TOKEN
+    if KAGGLE_USERNAME:
+        os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
 
 def run_cmd(cmd_list: list[str]) -> tuple[int, str]:
     set_kaggle_env()
